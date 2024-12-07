@@ -1,347 +1,364 @@
-#
-# Copyright (c) 2024 University of York and others
-#
-# This program and the accompanying materials are made available under the
-# terms of the Eclipse Public License 2.0 which is available at
-# http://www.eclipse.org/legal/epl-2.0.
-# 
-# SPDX-License-Identifier: EPL-2.0
-#
-# Contributors:
-#   * Alan Millard - initial contributor
-#   * Pedro Ribeiro - revised implementation
-#
- 
+# 导入系统模块
 import sys
+import time
 
-import rclpy
-from rclpy.node import Node
-from rclpy.signals import SignalHandlerOptions
-from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
-from rclpy.qos import QoSPresetProfiles
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+# 导入 ROS2 的核心库
+import rclpy  # ROS2 Python 客户端库
+from rclpy.node import Node  # ROS2 节点基类
+from rclpy.signals import SignalHandlerOptions  # 信号处理选项
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor  # 执行器和外部关闭异常
+from rclpy.qos import QoSPresetProfiles  # QoS 预设配置
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup  # 回调组，用于控制并发执行
 
-from std_msgs.msg import Float32
-from geometry_msgs.msg import Twist, Pose
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import LaserScan
-from auro_interfaces.msg import StringWithPose, Item, ItemList
-from auro_interfaces.srv import ItemRequest
+# 导入标准 ROS2 消息类型
+from std_msgs.msg import Float32  # 标准浮点消息
+from geometry_msgs.msg import Twist, Pose  # 几何消息，用于速度和位姿
+from nav_msgs.msg import Odometry  # 里程计消息
+from sensor_msgs.msg import LaserScan  # 激光扫描数据消息
 
-from tf_transformations import euler_from_quaternion
-import angles
+# 导入自定义接口的消息和服务
+from assessment_interfaces.msg import Item, ItemList  # 自定义消息类型
+from auro_interfaces.msg import StringWithPose
+from auro_interfaces.srv import ItemRequest # 自定义服务类型
 
-from enum import Enum
-import random
-import math
+# 导入数学工具
+from tf_transformations import euler_from_quaternion  # 四元数到欧拉角转换
+import angles  # 角度计算工具
+from enum import Enum  # 枚举类型，用于定义状态
+import random  # 随机数生成器
+import math  # 数学函数库
 
-LINEAR_VELOCITY  = 0.3 # Metres per second
-ANGULAR_VELOCITY = 0.5 # Radians per second
+# 定义机器人运动参数常量
+LINEAR_VELOCITY = 0.1  # 机器人前进速度（米/秒）
+ANGULAR_VELOCITY = 0.2  # 机器人转向速度（弧度/秒）
 
-TURN_LEFT = 1 # Postive angular velocity turns left
-TURN_RIGHT = -1 # Negative angular velocity turns right
+# 定义转向方向常量
+TURN_LEFT = 1  # 向左转的角速度方向
+TURN_RIGHT = -1  # 向右转的角速度方向
 
-SCAN_THRESHOLD = 0.5 # Metres per second
- # Array indexes for sensor sectors
-SCAN_FRONT = 0
-SCAN_LEFT = 1
-SCAN_BACK = 2
-SCAN_RIGHT = 3
+# 定义激光雷达参数
+SCAN_THRESHOLD = 0.2  # 激光雷达检测距离阈值（米）
+SCAN_FRONT = 0  # 前方区域索引
+SCAN_LEFT = 1  # 左侧区域索引
+SCAN_BACK = 2  # 后方区域索引
+SCAN_RIGHT = 3  # 右侧区域索引
 
-# Finite state machine (FSM) states
+# 定义机器人状态
 class State(Enum):
-    FORWARD = 0
-    TURNING = 1
-    COLLECTING = 2
-
+    FORWARD = 0     # 向前行驶状态
+    TURNING = 1     # 转向状态
+    COLLECTING = 2  # 收集物品状态
 
 class RobotController(Node):
-
     def __init__(self):
+        # 初始化节点
         super().__init__('robot_controller')
         
-        # Class variables used to store persistent values between executions of callbacks and control loop
-        self.state = State.FORWARD # Current FSM state
-        self.pose = Pose() # Current pose (position and orientation), relative to the odom reference frame
-        self.previous_pose = Pose() # Store a snapshot of the pose for comparison against future poses
-        self.yaw = 0.0 # Angle the robot is facing (rotation around the Z axis, in radians), relative to the odom reference frame
-        self.previous_yaw = 0.0 # Snapshot of the angle for comparison against future angles
-        self.turn_angle = 0.0 # Relative angle to turn to in the TURNING state
-        self.turn_direction = TURN_LEFT # Direction to turn in the TURNING state
-        self.goal_distance = random.uniform(1.0, 2.0) # Goal distance to travel in FORWARD state
-        self.scan_triggered = [False] * 4 # Boolean value for each of the 4 LiDAR sensor sectors. True if obstacle detected within SCAN_THRESHOLD
-        self.items = ItemList()
+        # 初始化执行器引用
+        self.executor = None
+        
+        # 初始化机器人状态变量
+        self.state = State.FORWARD  # 初始状态为向前行驶
+        self.pose = Pose()  # 当前位姿
+        self.previous_pose = Pose()  # 上一次位姿
+        self.yaw = 0.0  # 当前朝向角度
+        self.previous_yaw = 0.0  # 上一次朝向角度
+        self.turn_angle = 0.0  # 目标转向角度
+        self.turn_direction = TURN_LEFT  # 转向方向
+        self.goal_distance = random.uniform(1.0, 2.0)  # 目标行驶距离
+        
+        # 初始化传感器相关变量
+        self.scan_triggered = [False] * 4  # 激光雷达触发标志
+        self.items = ItemList()  # 检测到的物品列表
+        self.item_held = False  # 是否持有物品
+        
+        # 初始化扫描相关变量
+        self.scan_start_time = None  # 扫描开始时间
+        self.scan_duration = 2.0  # 扫描持续时间（秒）
 
+        # 声明和获取ROS参数
         self.declare_parameter('robot_id', 'robot1')
         self.robot_id = self.get_parameter('robot_id').value
 
-        # Here we use two callback groups, to ensure that those in 'client_callback_group' can be executed
-        # independently from those in 'timer_callback_group'. This allos calling the services below within
-        # a callback handled by the timer_callback_group. See https://docs.ros.org/en/humble/How-To-Guides/Using-callback-groups.html
-        # for a detailed discussion on the ROS executors and callback groups.
+        # 创建回调组
         client_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
 
-        self.pick_up_service = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
-        self.offload_service = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
-
-        self.item_subscriber = self.create_subscription(
-            ItemList,
-            '/items',
-            self.item_callback,
-            10, callback_group=timer_callback_group
+        # 创建服务客户端
+        self.pick_up_service = self.create_client(
+            ItemRequest,
+            '/pick_up_item',
+            callback_group=client_callback_group
+        )
+        self.offload_service = self.create_client(
+            ItemRequest,
+            '/offload_item',
+            callback_group=client_callback_group
         )
 
-        # Subscribes to Odometry messages published on /odom topic
-        # http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Odometry.html
-        #
-        # Final argument can either be an integer representing the history depth, or a Quality of Service (QoS) profile
-        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1335-L1338
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py#L1187-L1196
-        #
-        # If you only specify a history depth, rclpy defaults to QoSHistoryPolicy.KEEP_LAST
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L80-L83
+        # 创建订阅者
+        self.item_subscriber = self.create_subscription(
+            ItemList,
+            'items',
+            self.item_callback,
+            10,
+            callback_group=timer_callback_group
+        )
+
         self.odom_subscriber = self.create_subscription(
             Odometry,
             'odom',
             self.odom_callback,
-            10, callback_group=timer_callback_group)
-        
-        # Subscribes to LaserScan messages on the /scan topic
-        # http://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/LaserScan.html
-        #
-        # QoSPresetProfiles.SENSOR_DATA specifices "best effort" reliability and a small queue size
-        # https://docs.ros.org/en/humble/Concepts/Intermediate/About-Quality-of-Service-Settings.html
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L455
-        # https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/qos.py#L428-L431
+            10,
+            callback_group=timer_callback_group
+        )
+
         self.scan_subscriber = self.create_subscription(
             LaserScan,
             'scan',
             self.scan_callback,
-            QoSPresetProfiles.SENSOR_DATA.value, callback_group=timer_callback_group)
+            QoSPresetProfiles.SENSOR_DATA.value,
+            callback_group=timer_callback_group
+        )
 
-        # Publishes Twist messages (linear and angular velocities) on the /cmd_vel topic
-        # http://docs.ros.org/en/noetic/api/geometry_msgs/html/msg/Twist.html
-        # 
-        # Gazebo ROS differential drive plugin subscribes to these messages, and converts them into left and right wheel speeds
-        # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L537-L555
-        self.cmd_vel_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+        # 创建发布者
+        self.cmd_vel_publisher = self.create_publisher(
+            Twist,
+            'cmd_vel',
+            10
+        )
 
-        #self.orientation_publisher = self.create_publisher(Float32, '/orientation', 10)
+        self.marker_publisher = self.create_publisher(
+            StringWithPose,
+            'marker_input',
+            10,
+            callback_group=timer_callback_group
+        )
 
-        # Publishes custom StringWithPose (see auro_interfaces/msg/StringWithPose.msg) messages on the /marker_input topic
-        # The week3/rviz_text_marker node subscribes to these messages, and ouputs a Marker message on the /marker_output topic
-        # ros2 run week_3 rviz_text_marker
-        # This can be visualised in RViz: Add > By topic > /marker_output
-        #
-        # http://docs.ros.org/en/noetic/api/visualization_msgs/html/msg/Marker.html
-        # http://wiki.ros.org/rviz/DisplayTypes/Marker
-        self.marker_publisher = self.create_publisher(StringWithPose, 'marker_input', 10, callback_group=timer_callback_group)
-
-        # Creates a timer that calls the control_loop method repeatedly - each loop represents single iteration of the FSM
-        self.timer_period = 0.1 # 100 milliseconds = 10 Hz
-        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
+        # 创建控制循环定时器
+        self.timer_period = 0.1  # 10Hz
+        self.timer = self.create_timer(
+            self.timer_period,
+            self.control_loop,
+            callback_group=timer_callback_group
+        )
 
     def item_callback(self, msg):
+        """处理物品检测消息的回调函数"""
         self.items = msg
+        if len(self.items.data) > 0:
+            self.get_logger().debug(f"检测到 {len(self.items.data)} 个物品")
 
-    # Called every time odom_subscriber receives an Odometry message from the /odom topic
-    #
-    # The Gazebo ROS differential drive plugin generates these messages using kinematic equations, and publishes them
-    # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_diff_drive.cpp#L434-L535
-    #
-    # This plugin is configured with physical measurements of the TurtleBot3 in the SDF file that defines the robot model
-    # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble-devel/turtlebot3_gazebo/models/turtlebot3_waffle_pi/model.sdf#L476-L507
-    #
-    # The pose estimates are expressed in a coordinate system relative to the starting pose of the robot
     def odom_callback(self, msg):
-        self.pose = msg.pose.pose # Store the pose in a class variable
+        """处理里程计消息的回调函数"""
+        self.pose = msg.pose.pose
+        # 将四元数转换为欧拉角
+        (roll, pitch, yaw) = euler_from_quaternion([
+            self.pose.orientation.x,
+            self.pose.orientation.y,
+            self.pose.orientation.z,
+            self.pose.orientation.w
+        ])
+        self.yaw = yaw
 
-        # Uses tf_transformations package to convert orientation from quaternion to Euler angles (RPY = roll, pitch, yaw)
-        # https://github.com/DLu/tf_transformations
-        #
-        # Roll (rotation around X axis) and pitch (rotation around Y axis) are discarded
-        (roll, pitch, yaw) = euler_from_quaternion([self.pose.orientation.x,
-                                                    self.pose.orientation.y,
-                                                    self.pose.orientation.z,
-                                                    self.pose.orientation.w])
-        
-        
-        self.yaw = yaw # Store the yaw in a class variable
-
-    # Called every time scan_subscriber recieves a LaserScan message from the /scan topic
-    #
-    # The Gazebo RaySensor calculates distance at which rays intersect with obstacles
-    # The data is published by the Gazebo ROS ray sensor plugin
-    # https://github.com/gazebosim/gazebo-classic/tree/gazebo11/gazebo/sensors
-    # https://github.com/ros-simulation/gazebo_ros_pkgs/blob/ros2/gazebo_plugins/src/gazebo_ros_ray_sensor.cpp#L178-L205
-    #
-    # This plugin is configured to match the LiDAR on the TurtleBot3 in the SDF file that defines the robot model
-    # http://wiki.ros.org/hls_lfcd_lds_driver
-    # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble-devel/turtlebot3_gazebo/models/turtlebot3_waffle_pi/model.sdf#L132-L165
     def scan_callback(self, msg):
-        # Group scan ranges into 4 segments
-        # Front, left, and right segments are each 60 degrees
-        # Back segment is 180 degrees
-        front_ranges = msg.ranges[331:359] + msg.ranges[0:30] # 30 to 331 degrees (30 to -30 degrees)
-        left_ranges  = msg.ranges[31:90] # 31 to 90 degrees (31 to 90 degrees)
-        back_ranges  = msg.ranges[91:270] # 91 to 270 degrees (91 to -90 degrees)
-        right_ranges = msg.ranges[271:330] # 271 to 330 degrees (-30 to -91 degrees)
+        """处理激光雷达扫描消息的回调函数"""
+        # 将扫描数据分为四个区域
+        front_ranges = msg.ranges[270:359] + msg.ranges[0:90]
+        left_ranges = msg.ranges[90:180]
+        back_ranges = msg.ranges[180:270]
+        right_ranges = msg.ranges[270:360]
 
-        # Store True/False values for each sensor segment, based on whether the nearest detected obstacle is closer than SCAN_THRESHOLD
-        self.scan_triggered[SCAN_FRONT] = min(front_ranges) < SCAN_THRESHOLD 
-        self.scan_triggered[SCAN_LEFT]  = min(left_ranges)  < SCAN_THRESHOLD
-        self.scan_triggered[SCAN_BACK]  = min(back_ranges)  < SCAN_THRESHOLD
+        # 更新障碍物检测标志
+        self.scan_triggered[SCAN_FRONT] = min(front_ranges) < SCAN_THRESHOLD
+        self.scan_triggered[SCAN_LEFT] = min(left_ranges) < SCAN_THRESHOLD
+        self.scan_triggered[SCAN_BACK] = min(back_ranges) < SCAN_THRESHOLD
         self.scan_triggered[SCAN_RIGHT] = min(right_ranges) < SCAN_THRESHOLD
 
-
-    # Control loop for the FSM - called periodically by self.timer
     def control_loop(self):
-
-        # Send message to rviz_text_marker node
+        """主控制循环 - 实现有限状态机"""
+        # 发布当前状态到RViz
         marker_input = StringWithPose()
-        marker_input.text = str(self.state) # Visualise robot state as an RViz marker
-        marker_input.pose = self.pose # Set the pose of the RViz marker to track the robot's pose
+        marker_input.text = str(self.state)
+        marker_input.pose = self.pose
         self.marker_publisher.publish(marker_input)
 
-        #self.get_logger().info(f"{self.state}")
-        
+        # 状态机实现
         match self.state:
-
             case State.FORWARD:
-
-                if self.scan_triggered[SCAN_FRONT]:
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = random.uniform(150, 170)
-                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                    self.get_logger().info("Detected obstacle in front, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
-                    return
-                
-                if self.scan_triggered[SCAN_LEFT] or self.scan_triggered[SCAN_RIGHT]:
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = 45
-
-                    if self.scan_triggered[SCAN_LEFT] and self.scan_triggered[SCAN_RIGHT]:
-                        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                        self.get_logger().info("Detected obstacle to both the left and right, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
-                    elif self.scan_triggered[SCAN_LEFT]:
-                        self.turn_direction = TURN_RIGHT
-                        self.get_logger().info(f"Detected obstacle to the left, turning right by {self.turn_angle} degrees")
-                    else: # self.scan_triggered[SCAN_RIGHT]
-                        self.turn_direction = TURN_LEFT
-                        self.get_logger().info(f"Detected obstacle to the right, turning left by {self.turn_angle} degrees")
-                    return
-                
-                if len(self.items.data) > 0:
-                    self.state = State.COLLECTING
-                    return
-
-                msg = Twist()
-                msg.linear.x = LINEAR_VELOCITY
-                self.cmd_vel_publisher.publish(msg)
-
-                difference_x = self.pose.position.x - self.previous_pose.position.x
-                difference_y = self.pose.position.y - self.previous_pose.position.y
-                distance_travelled = math.sqrt(difference_x ** 2 + difference_y ** 2)
-
-                # self.get_logger().info(f"Driven {distance_travelled:.2f} out of {self.goal_distance:.2f} metres")
-
-                if distance_travelled >= self.goal_distance:
-                    self.previous_yaw = self.yaw
-                    self.state = State.TURNING
-                    self.turn_angle = random.uniform(30, 150)
-                    self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
-                    self.get_logger().info("Goal reached, turning " + ("left" if self.turn_direction == TURN_LEFT else "right") + f" by {self.turn_angle:.2f} degrees")
-
+                self._handle_forward_state()
             case State.TURNING:
-
-                self.get_logger().info("Turning state")
-
-                if len(self.items.data) > 0:
-                    self.state = State.COLLECTING
-                    return
-
-                msg = Twist()
-                msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
-                self.cmd_vel_publisher.publish(msg)
-
-                # self.get_logger().info(f"Turned {math.degrees(math.fabs(yaw_difference)):.2f} out of {self.turn_angle:.2f} degrees")
-
-                yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)                
-
-                if math.fabs(yaw_difference) >= math.radians(self.turn_angle):
-                    self.previous_pose = self.pose
-                    self.goal_distance = random.uniform(1.0, 2.0)
-                    self.state = State.FORWARD
-                    self.get_logger().info(f"Finished turning, driving forward by {self.goal_distance:.2f} metres")
-
+                self._handle_turning_state()
             case State.COLLECTING:
+                self._handle_collecting_state()
 
-                if len(self.items.data) == 0:
-                    self.previous_pose = self.pose
-                    self.state = State.FORWARD
-                    return
-                
-                item = self.items.data[0]
+    def _handle_forward_state(self):
+        """处理前进状态的逻辑"""
+        if self.scan_triggered[SCAN_FRONT]:
+            # 检测到前方障碍物，准备转向
+            self._prepare_turn(150, 170)
+            return
 
-                # Obtained by curve fitting from experimental runs.
-                estimated_distance = 32.4 * float(item.diameter) ** -0.75 #69.0 * float(item.diameter) ** -0.89
+        if len(self.items.data) > 0:
+            # 检测到物品，切换到收集状态
+            self.state = State.COLLECTING
+            return
 
-                self.get_logger().info(f'Estimated distance {estimated_distance}')
-
-                if estimated_distance <= 0.35:
-                    rqt = ItemRequest.Request()
-                    rqt.robot_id = self.robot_id
-                    try:
-                        future = self.pick_up_service.call_async(rqt)
-                        self.executor.spin_until_future_complete(future)
-                        response = future.result()
-                        if response.success:
-                            self.get_logger().info('Item picked up.')
-                            self.state = State.FORWARD
-                            self.items.data = []
-                        else:
-                            self.get_logger().info('Unable to pick up item: ' + response.message)
-                    except Exception as e:
-                        self.get_logger().info('Exception ' + e)   
-
-                msg = Twist()
-                msg.linear.x = 0.25 * estimated_distance
-                msg.angular.z = item.x / 320.0
-                self.cmd_vel_publisher.publish(msg)
-
-            case _:
-                pass
-        
-    def destroy_node(self):
+        # 正常前进
         msg = Twist()
+        msg.linear.x = LINEAR_VELOCITY
         self.cmd_vel_publisher.publish(msg)
-        self.get_logger().info(f"Stopping: {msg}")
+
+        # 检查是否达到目标距离
+        if self._check_distance_reached():
+            self.state = State.COLLECTING
+            self.get_logger().info("到达目标距离，准备收集物品")
+
+    def _handle_turning_state(self):
+        """处理转向状态的逻辑"""
+        msg = Twist()
+        msg.angular.z = self.turn_direction * ANGULAR_VELOCITY
+        self.cmd_vel_publisher.publish(msg)
+
+        # 检查是否完成转向
+        yaw_difference = angles.normalize_angle(self.yaw - self.previous_yaw)
+        if math.fabs(yaw_difference) >= math.radians(self.turn_angle):
+            self._complete_turn()
+
+    def _handle_collecting_state(self):
+        """处理收集物品状态的逻辑"""
+        if len(self.items.data) == 0:
+            self._handle_scanning()
+            return
+
+        item = self.items.data[0]
+        heading_error = item.x / 320.0
+        distance = 32.4 * float(item.diameter) ** -0.75
+
+        if distance <= 0.35:
+            self._attempt_pickup()
+        else:
+            self._approach_item(distance, heading_error)
+
+    def _handle_scanning(self):
+        """处理扫描过程的逻辑"""
+        current_time = self.get_clock().now()
+        if self.scan_start_time is None:
+            self.scan_start_time = current_time
+
+        if (current_time - self.scan_start_time).nanoseconds < self.scan_duration * 1e9:
+            msg = Twist()
+            msg.angular.z = 0.3
+            self.cmd_vel_publisher.publish(msg)
+        else:
+            self.scan_start_time = None
+            self.state = State.FORWARD
+
+    def _attempt_pickup(self):
+        """尝试拾取物品的逻辑"""
+        # 停止机器人
+        stop_msg = Twist()
+        self.cmd_vel_publisher.publish(stop_msg)
+
+        # 创建并发送拾取请求
+        rqt = ItemRequest.Request()
+        rqt.robot_id = self.robot_id
+
+        try:
+            future = self.pick_up_service.call_async(rqt)
+            self.executor.spin_until_future_complete(future)
+            response = future.result()
+
+            if response.success:
+                self.get_logger().info('物品拾取成功')
+                self.item_held = True
+                self.state = State.FORWARD
+                self.previous_pose = self.pose
+                self.goal_distance = random.uniform(1.0, 2.0)
+            else:
+                self.get_logger().warn(f'物品拾取失败: {response.message}')
+                self._handle_pickup_failure()
+
+        except Exception as e:
+            self.get_logger().error(f'拾取过程发生错误: {str(e)}')
+            self.state = State.FORWARD
+
+    def _handle_pickup_failure(self):
+        """处理拾取失败的情况"""
+        backup_msg = Twist()
+        backup_msg.linear.x = -0.1
+        self.cmd_vel_publisher.publish(backup_msg)
+        self.state = State.FORWARD
+
+    def _approach_item(self, distance, heading_error):
+        """控制机器人接近物品"""
+        msg = Twist()
+        msg.linear.x = min(0.15, 0.2 * distance)
+        msg.angular.z = 0.5 * heading_error
+        self.cmd_vel_publisher.publish(msg)
+
+    def _prepare_turn(self, min_angle, max_angle):
+        """准备转向动作"""
+        self.previous_yaw = self.yaw
+        self.state = State.TURNING
+        self.turn_angle = random.uniform(min_angle, max_angle)
+        self.turn_direction = random.choice([TURN_LEFT, TURN_RIGHT])
+        self.get_logger().info(
+            f"开始转向 {self.turn_angle:.2f} 度，方向：" +
+            ("左" if self.turn_direction == TURN_LEFT else "右")
+        )
+
+    def _complete_turn(self):
+        """完成转向动作"""
+        self.previous_pose = self.pose
+        self.goal_distance = random.uniform(1.0, 2.0)
+        self.state = State.FORWARD
+        self.get_logger().info(f"转向完成，开始前进 {self.goal_distance:.2f} 米")
+
+    def _check_distance_reached(self):
+        """检查是否达到目标距离"""
+        dx = self.pose.position.x - self.previous_pose.position.x
+        dy = self.pose.position.y - self.previous_pose.position.y
+        distance_travelled = math.sqrt(dx * dx + dy * dy)
+        return distance_travelled >= self.goal_distance
+
+    def destroy_node(self):
+        """清理并销毁节点"""
+        # 停止机器人
+        stop_msg = Twist()
+        self.cmd_vel_publisher.publish(stop_msg)
+        self.get_logger().info("正在停止机器人并清理资源")
         super().destroy_node()
 
-
 def main(args=None):
+    """主函数"""
+    # 初始化ROS2
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
 
-    rclpy.init(args = args, signal_handler_options = SignalHandlerOptions.NO)
-
+    # 创建节点和执行器
     node = RobotController()
-
     executor = MultiThreadedExecutor()
+    
+    # 设置节点的执行器引用
+    node.executor = executor
+    
+    # 将节点添加到执行器
     executor.add_node(node)
 
     try:
+        # 运行执行器
         executor.spin()
     except KeyboardInterrupt:
-        pass
+        # 处理Ctrl+C中断
+        node.get_logger().info("收到键盘中断信号，正在关闭节点...")
     except ExternalShutdownException:
+        # 处理外部关闭信号
+        node.get_logger().error("收到外部关闭信号")
         sys.exit(1)
     finally:
+        # 清理资源
         node.destroy_node()
         rclpy.try_shutdown()
-
 
 if __name__ == '__main__':
     main()
