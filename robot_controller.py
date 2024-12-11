@@ -1,22 +1,27 @@
+# 导入系统模块
 import sys
 import time
 
-import rclpy  # ROS2 Python客户端库
-from rclpy.node import Node  # ROS2节点基类
+# 导入 ROS2 的核心库
+import rclpy  # ROS2 Python 客户端库
+from rclpy.node import Node  # ROS2 节点基类
 from rclpy.signals import SignalHandlerOptions  # 信号处理选项
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor  # 执行器和外部关闭异常
-from rclpy.qos import QoSPresetProfiles  # QoS预设配置
+from rclpy.qos import QoSPresetProfiles  # QoS 预设配置
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup  # 回调组，用于控制并发执行
 
+# 导入标准 ROS2 消息类型
 from std_msgs.msg import Float32  # 标准浮点消息
 from geometry_msgs.msg import Twist, Pose  # 几何消息，用于速度和位姿
 from nav_msgs.msg import Odometry  # 里程计消息
 from sensor_msgs.msg import LaserScan  # 激光扫描数据消息
 
+# 导入自定义接口的消息和服务
 from assessment_interfaces.msg import Item, ItemList  # 自定义消息类型
 from auro_interfaces.msg import StringWithPose
-from auro_interfaces.srv import ItemRequest  # 自定义服务类型
+from auro_interfaces.srv import ItemRequest # 自定义服务类型
 
+# 导入数学工具
 from tf_transformations import euler_from_quaternion  # 四元数到欧拉角转换
 import angles  # 角度计算工具
 from enum import Enum  # 枚举类型，用于定义状态
@@ -24,8 +29,8 @@ import random  # 随机数生成器
 import math  # 数学函数库
 
 # 定义机器人运动参数常量
-LINEAR_VELOCITY = 0.5  # 机器人前进速度（米/秒）
-ANGULAR_VELOCITY = 0.5  # 机器人转向速度（弧度/秒）
+LINEAR_VELOCITY = 0.1  # 机器人前进速度（米/秒）
+ANGULAR_VELOCITY = 0.2  # 机器人转向速度（弧度/秒）
 
 # 定义转向方向常量
 TURN_LEFT = 1  # 向左转的角速度方向
@@ -40,20 +45,18 @@ SCAN_RIGHT = 3  # 右侧区域索引
 
 # 定义机器人状态
 class State(Enum):
-    FORWARD = 0  # 向前行驶状态
-    TURNING = 1  # 转向状态
+    FORWARD = 0     # 向前行驶状态
+    TURNING = 1     # 转向状态
     COLLECTING = 2  # 收集物品状态
-    MOVING_TO_DROP_POINT = 3  # 前往放置物品的固定位置状态
-    DROPPING = 4  # 放置物品状态
 
 class RobotController(Node):
     def __init__(self):
         # 初始化节点
         super().__init__('robot_controller')
-
+        
         # 初始化执行器引用
         self.executor = None
-
+        
         # 初始化机器人状态变量
         self.state = State.FORWARD  # 初始状态为向前行驶
         self.pose = Pose()  # 当前位姿
@@ -63,17 +66,12 @@ class RobotController(Node):
         self.turn_angle = 0.0  # 目标转向角度
         self.turn_direction = TURN_LEFT  # 转向方向
         self.goal_distance = random.uniform(1.0, 2.0)  # 目标行驶距离
-
-        # 新增固定放置点位置（这里示例设置为x=3.0, y=3.0，可根据实际需求调整）
-        self.drop_point = Pose()
-        self.drop_point.position.x = -5.0
-        self.drop_point.position.y = 0.0
-
+        
         # 初始化传感器相关变量
         self.scan_triggered = [False] * 4  # 激光雷达触发标志
         self.items = ItemList()  # 检测到的物品列表
         self.item_held = False  # 是否持有物品
-
+        
         # 初始化扫描相关变量
         self.scan_start_time = None  # 扫描开始时间
         self.scan_duration = 2.0  # 扫描持续时间（秒）
@@ -193,10 +191,6 @@ class RobotController(Node):
                 self._handle_turning_state()
             case State.COLLECTING:
                 self._handle_collecting_state()
-            case State.MOVING_TO_DROP_POINT:
-                self._handle_moving_to_drop_point()
-            case State.DROPPING:
-                self._handle_dropping()
 
     def _handle_forward_state(self):
         """处理前进状态的逻辑"""
@@ -278,7 +272,7 @@ class RobotController(Node):
             if response.success:
                 self.get_logger().info('物品拾取成功')
                 self.item_held = True
-                self.state = State.MOVING_TO_DROP_POINT
+                self.state = State.FORWARD
                 self.previous_pose = self.pose
                 self.goal_distance = random.uniform(1.0, 2.0)
             else:
@@ -328,54 +322,6 @@ class RobotController(Node):
         distance_travelled = math.sqrt(dx * dx + dy * dy)
         return distance_travelled >= self.goal_distance
 
-    def _handle_moving_to_drop_point(self):
-        """处理前往放置物品固定位置的逻辑"""
-        # 计算当前位置与目标放置点位置的距离和角度偏差
-        dx = self.drop_point.position.x - self.pose.position.x
-        dy = self.drop_point.position.y - self.pose.position.y
-        distance_to_drop_point = math.sqrt(dx * dx + dy * dy)
-        target_yaw = math.atan2(dy, dx)
-        yaw_difference = angles.normalize_angle(target_yaw - self.yaw)
-
-        # 根据距离和角度偏差发布速度指令
-        msg = Twist()
-        msg.linear.x = min(0.1, 0.2 * distance_to_drop_point)
-        msg.angular.z = 0.5 * yaw_difference
-
-        self.cmd_vel_publisher.publish(msg)
-
-        # 判断是否到达目标放置点附近（这里设定距离小于0.2米认为到达）
-        if distance_to_drop_point < 0.2:
-            self.state = State.DROPPING
-
-    def _handle_dropping(self):
-        """处理放置物品的逻辑"""
-        # 停止机器人
-        stop_msg = Twist()
-        self.cmd_vel_publisher.publish(stop_msg)
-
-        # 创建并发送卸载物品请求
-        rqt = ItemRequest.Request()
-        rqt.robot_id = self.robot_id
-
-        try:
-            future = self.offload_service.call_async(rqt)
-            self.executor.spin_until_future_complete(future)
-            response = future.result()
-
-            if response.success:
-                self.get_logger().info('物品放置成功')
-                self.item_held = False
-                self.state = State.FORWARD
-                self.previous_pose = self.pose
-                self.goal_distance = random.uniform(1.0, 2.0)
-            else:
-                self.get_logger().warn(f'物品放置失败: {response.message}')
-            # 这里可以根据实际情况添加更多处理放置失败的逻辑
-
-        except Exception as e:
-            self.get_logger().error(f'放置过程发生错误: {str(e)}')
-
     def destroy_node(self):
         """清理并销毁节点"""
         # 停止机器人
@@ -383,7 +329,6 @@ class RobotController(Node):
         self.cmd_vel_publisher.publish(stop_msg)
         self.get_logger().info("正在停止机器人并清理资源")
         super().destroy_node()
-
 
 def main(args=None):
     """主函数"""
@@ -393,10 +338,10 @@ def main(args=None):
     # 创建节点和执行器
     node = RobotController()
     executor = MultiThreadedExecutor()
-
+    
     # 设置节点的执行器引用
     node.executor = executor
-
+    
     # 将节点添加到执行器
     executor.add_node(node)
 
@@ -415,7 +360,5 @@ def main(args=None):
         node.destroy_node()
         rclpy.try_shutdown()
 
-
 if __name__ == '__main__':
     main()
-
